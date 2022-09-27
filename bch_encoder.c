@@ -42,6 +42,48 @@
 * 
 /*******************************************************************************/
 
+/*-----------------------------------------------------------------------------
+ * CJChen1@nuvoton, 2011/8/19, To meet Nuvoton chip design for BCH T24, we have to
+ *      1. cut input data to several 1024 bytes (8192 bits) segments for T24;
+ *         cut input data to several  512 bytes (4096 bits) segments for others;
+ *      2. pad some bytes 0 for each data segments;
+ *              for T4,  parity lenght is  60 bits <=  8 bytes, we need to padding (32-8)  bytes 0
+ *              for T8,  parity lenght is 120 bits <= 15 bytes, we need to padding (32-15) bytes 0
+ *              for T12, parity lenght is 180 bits <= 23 bytes, we need to padding (32-23) bytes 0
+ *              for T15, parity lenght is 225 bits <= 29 bytes, we need to padding (32-29) bytes 0
+ *              for T24, parity lenght is             45 bytes, we need to padding (64-45) bytes 0
+ *      3. invert each data segment by bit-stream order;
+ *      4. calculate BCH parity code for each data segment by normal BCH algorithm;
+ *      5. invert each parity by bit-stream order.
+ *
+ *      Besides, we support enable/disable for SMCR[PROT_3BEN].
+ *
+ * CJChen1@nuvoton, 2011/1/31, To verify reliability for this program,
+ *      6. modify output format in order to compare to chip data easier.
+ *              output raw data (no inverting and padding) and parity with Nuvoton style.
+ *---------------------------------------------------------------------------*/
+#define CFLAG_DEBUG             0
+#define CFLAG_NTC               1
+
+#if CFLAG_NTC
+    #define NTC_DATA_FULL_SIZE      (ntc_data_size + data_pad_size)
+    #define NTC_DATA_SIZE_512       4096
+    #define NTC_DATA_SIZE_1024      8192
+    int ntc_data_size;              // the bit size for one data segment
+    int data_pad_size;              // the bit length to padding 0, value base on BCH type
+    int Redundancy_protect;         // Redundancy protect indicator
+
+    // define the total padding bytes for 512/1024 data segment
+    #define BCH_PADDING_LEN_512     32
+    #define BCH_PADDING_LEN_1024    64
+    // define the BCH parity code lenght for 512 bytes data pattern
+    #define BCH_PARITY_LEN_T4   8
+    #define BCH_PARITY_LEN_T8   15
+    #define BCH_PARITY_LEN_T12  23
+    #define BCH_PARITY_LEN_T15  29
+    // define the BCH parity code lenght for 1024 bytes data pattern
+    #define BCH_PARITY_LEN_T24      45
+#endif
 
 #include "bch_global.c"
 
@@ -54,10 +96,55 @@ void parallel_encode_bch()
  */
 {	int i, j, iii, Temp, bb_temp[rr_max] ;
 	int loop_count ;
-	
-	// Determine the number of loops required for parallelism.  
-	loop_count = ceil(kk_shorten / (double)Parallel) ;	
-	
+
+#if CFLAG_NTC
+/*-----------------------------------------------------------------------------
+ * CJChen1@nuvoton, 2011/1/20, To meet Nuvoton chip design, we have to
+ *      2. pad some bytes 0 for each data segments;
+ *      3. invert each data segment by bit-stream order;
+ *      The length of data segment MUST be (segment+padding) bits.
+ *      Element of data[x] is one bit for input data.
+ *
+ *      Besides, we support enable/disable for SMCR[PROT_3BEN].
+ *      Here, we modify padding data according to variable Redundancy_protect.
+ *---------------------------------------------------------------------------*/
+    for (i = kk_shorten; i < NTC_DATA_FULL_SIZE; i++) // padding 0
+    {   data[i] = 0; }
+
+    // to support SMCR[PROT_3BEN] enable function.
+    if (Redundancy_protect)
+    {
+//        for (i = kk_shorten; i < kk_shorten + 16; i++)
+//            data[i] = 1;    // padding redundancy data 0xffff00 if SMCR[PROT_3BEN] enable
+
+        // padding redundancy data from input_ra_data if SMCR[PROT_3BEN] enable
+        for (i = 0; i < 24; i++)
+        {
+            j = i / 8;      // byte index of input_ra_data[]
+            if (i % 8 == 0)
+                iii = 7;    // bit index of input_ra_data[j]
+            data[kk_shorten+i] = (input_ra_data[j] >> iii) & 0x01;  // convert one bit one element of data[]
+            iii--;
+        }
+    }
+
+    kk_shorten += data_pad_size;  // temporarily, extend kk_shorten to include padding 0
+
+    i = 0;
+    j = NTC_DATA_FULL_SIZE - 1;   // always invert (raw data + padding data)
+    while (i < j)
+    {
+        Temp = data[i];
+        data[i] = data[j];
+        data[j] = Temp;
+        i++;
+        j--;
+    }
+#endif
+
+	// Determine the number of loops required for parallelism.
+	loop_count = ceil(kk_shorten / (double)Parallel);
+
 	// Serial to parallel data conversion
 	for (i = 0; i < Parallel; i++)
 	{	for (j = 0; j < loop_count; j++)
@@ -67,11 +154,21 @@ void parallel_encode_bch()
 				data_p[i][j] = 0;
 		}
 	}
-	
+
+/*-----------------------------------------------------------------------------
+ * CJChen1@nuvoton, 2011/1/20, modify nothing, just describe the structure of data_p.
+ *      Element of data_p[r][c] is one bit for input stream. The bit order is
+ *          data_p[0][0]=bit 0,     data_p[0][1]=bit p,    ...    , data_p[0][loop_count-1]
+ *          data_p[1][0]=bit 1,     data_p[1][1]=bit p+1,  ...    , data_p[1][loop_count-1]
+ *               ...                     ...
+ *          data_p[p-1][0]=bit p-1, data_p[p-1][1]=bit 2*p-1, ... , data_p[p-1][loop_count-1]
+ *          where p is Parallel.
+ *---------------------------------------------------------------------------*/
+
 	// Initialize the parity bits.
 	for (i = 0; i < rr; i++)
 		bb[i] = 0;
-	
+
 	// Compute parity checks
 	// S(t) = T_G_R [ S(t-1) + M(t) ]
 	// Ref: Parallel CRC, Shieh, 2001
@@ -80,7 +177,7 @@ void parallel_encode_bch()
 			bb_temp[i] = bb[i] ;
 		for (i = Parallel - 1; i >= 0; i--)
 			bb_temp[rr - Parallel + i] = bb_temp[rr - Parallel + i] ^ data_p[i][iii];
-		
+
 		for (i = 0; i < rr; i++)
 		{	Temp = 0;
 			for (j = 0; j < rr; j++)
@@ -88,7 +185,27 @@ void parallel_encode_bch()
 			bb[i] = Temp;
 		}
 	}
-	
+
+#if CFLAG_NTC
+    kk_shorten -= data_pad_size;  // recover kk_shorten
+
+/*-----------------------------------------------------------------------------
+ * CJChen1@nuvoton, 2011/1/20, To meet Nuvoton chip design, we have to
+ *      5. invert each parity by bit-stream order.
+ *      Element of bb[x] is one bit for output parity.
+ *---------------------------------------------------------------------------*/
+    i = 0;
+    j = rr -1;
+    while (i < j)
+    {
+        Temp = bb[i];
+        bb[i] = bb[j];
+        bb[j] = Temp;
+        i++;
+        j--;
+    }
+#endif
+
 }
 
 int main(int argc,  char** argv)
@@ -97,18 +214,18 @@ int main(int argc,  char** argv)
 	int Input_kk ;				// Input indicator
 	int in_count, in_v, in_codeword;	// Input statistics
 	char in_char;
-	
+
 	fprintf(stderr, "# Binary BCH encoder.  Use -h for details.\n\n");
-	
+
 	Verbose = 0;
 	Input_kk = 0;
 	Help = 0;
 	mm = df_m;
 	tt = df_t;
 	Parallel = df_p;
-	for (i = 1; i < argc;i++) 
-	{	if (argv[i][0] == '-') 
-		{	switch (argv[i][1]) 
+	for (i = 1; i < argc;i++)
+	{	if (argv[i][0] == '-')
+		{	switch (argv[i][1])
 			{	case 'm': mm = atoi(argv[++i]);
 					if (mm > mm_max)
 						Help = 1;
@@ -129,10 +246,10 @@ int main(int argc,  char** argv)
 				default: Help = 1;
 			}
 		}
-		else 
+		else
 			Help = 1;
 	}
-	
+
 	if (Help == 1)
 	{	fprintf(stdout,"# Usage %s:  BCH encoder\n", argv[0]);
 		fprintf(stdout,"    -h:  This help message\n");
@@ -158,13 +275,13 @@ int main(int argc,  char** argv)
 	else
 	{	nn = (int)pow(2, mm) - 1 ;
 		nn_shorten = nn ;
-		
+
 		// generate the Galois Field GF(2**mm)
 		generate_gf() ;
-		
+
 		// Compute the generator polynomial and lookahead matrix for BCH code
 		gen_poly() ;
-		
+
 		// Check if code is shortened
 		if (Input_kk == 1)
 			nn_shorten = kk_shorten + rr ;
@@ -174,15 +291,15 @@ int main(int argc,  char** argv)
 			kk_shorten = kk_shorten - kk_shorten % 4 ;
 			nn_shorten = kk_shorten + rr ;
 		}
-		
+
 		fprintf(stdout, "{# (m = %d, n = %d, k = %d, t = %d, r = %d) Binary BCH code.}\n", mm, nn_shorten, kk_shorten, tt, rr) ;
-		
+
 		// Read in data stream
 		in_count = 0;
 		in_codeword = 0;
-		
+
 		in_char = getchar();
-		while (in_char != EOF) 
+		while (in_char != EOF)
 		{	if (in_char=='{') 
 			{	while ((in_char != EOF) && ((char)in_char != '}'))
 					in_char = getchar();
